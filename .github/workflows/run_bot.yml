@@ -1,0 +1,31 @@
+name: Run Delta Crypto Bot
+
+on:
+  schedule:
+    # This triggers the bot to boot up and run every hour automatically
+    - cron: '0 * * * *'
+  workflow_dispatch: # Allows you to click a button to start it manually anytime
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Trading Script
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+        run: python bot.py
