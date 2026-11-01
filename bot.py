@@ -6,16 +6,16 @@ import pandas as pd
 import pandas_ta as ta
 from twilio.rest import Client
 
-# --- Secure Configuration Layer (Reads directly from Render Environment Variables) ---
+# --- Secure Configuration Layer (Reads from GitHub Repository Secrets) ---
 TWILIO_SID    = os.getenv('TWILIO_SID')
 TWILIO_TOKEN  = os.getenv('TWILIO_TOKEN')
-FROM_WHATSAPP = 'whatsapp:+14155238886'               # Default Twilio Sandbox Number
-TO_WHATSAPP   = os.getenv('MY_WHATSAPP_NUMBER')      # e.g., whatsapp:+91XXXXXXXXXX
+FROM_WHATSAPP = 'whatsapp:+14155238886'
+TO_WHATSAPP   = os.getenv('MY_WHATSAPP_NUMBER')
 
 # --- Strategy Constants & Inputs (Optimized Timeframes) ---
 SYMBOL = 'BTC/USDT:USDT'
-LTF_TIMEFRAME = '15m'  # Micro Execution Chart (15 Minutes)
-HTF_TIMEFRAME = '1h'   # Macro Trend Filter (1 Hour)
+LTF_TIMEFRAME = '15m'
+HTF_TIMEFRAME = '1h'
 
 RSI_LENGTH = 14
 HTF_SMOOTH_LEN = 9
@@ -26,7 +26,6 @@ SHORT_CEILING = 70
 SHORT_TRIGGER = 65
 
 STOP_PERCENT = 2.5
-BREAK_EVEN_TRIGGER = 1.5
 ATR_VOLUME_PERIOD = 20
 
 STATE_FILE = "bot_state.json"
@@ -35,12 +34,11 @@ STATE_FILE = "bot_state.json"
 exchange = ccxt.delta({
     'apiKey': os.getenv('DELTA_API_KEY'),
     'secret': os.getenv('DELTA_API_SECRET'),
-
     'enableRateLimit': True,
     'urls': {
         'api': {
-            'public': 'https://api.india.delta.exchange',
-            'private': 'https://api.india.delta.exchange',
+            'public': 'https://delta.exchange',
+            'private': 'https://delta.exchange',
         }
     }
 })
@@ -48,14 +46,13 @@ exchange = ccxt.delta({
 # --- WhatsApp Alert Core Engine ---
 def send_whatsapp_alert(msg):
     try:
-        # Check if Twilio configuration is present before attempting to send
         if not TWILIO_SID or not TWILIO_TOKEN or not TO_WHATSAPP:
             print(f"[WHATSAPP SKIP] Environment variables missing. Alert log: {msg}")
             return
             
         client = Client(TWILIO_SID, TWILIO_TOKEN)
         client.messages.create(
-            body=f"🤖 *Delta Bot Alert*:\n{msg}",
+            body=f"Delta Bot Alert: {msg}",
             from_=FROM_WHATSAPP,
             to=TO_WHATSAPP
         )
@@ -71,7 +68,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"position_size": 0.0, "entry_price": None, "break_even_protected": False}
+    return {"position_size": 0.0, "entry_price": None, "highest_price": None, "lowest_price": None, "trailing_mode": "initial"}
 
 def save_state(state):
     with open(STATE_FILE, 'w') as f:
@@ -154,77 +151,103 @@ def run_strategy():
     short_entry_condition = short_snapback and bearish_macro and market_is_volatile and (state["position_size"] >= 0)
     
     current_pos = state["position_size"]
-    
-    # 7. Risk Engine Execution Logic & Target Tracking (Live Pricing)
     live_price = df_ltf['close'].iloc[-1]
     
+    # --- Advanced ATR Trailing Risk Engine ---
     if current_pos != 0:
         entry_p = state["entry_price"]
         
-        # Long Position Tracking Rules
-        if current_pos > 0:
-            if not state["break_even_protected"] and (live_price >= entry_p * (1 + (BREAK_EVEN_TRIGGER / 100))):
-                state["break_even_protected"] = True
-                send_whatsapp_alert(f"🛡️ *Break-Even Protected*\n15m Long entry at {entry_p} is now protected at par.")
+        if current_pos > 0:  # Long Position Risk Tracking
+            if state["highest_price"] is None or live_price > state["highest_price"]:
+                state["highest_price"] = live_price
                 save_state(state)
                 
-            current_stop = entry_p if state["break_even_protected"] else (entry_p * (1 - (STOP_PERCENT / 100)))
+            current_profit_pct = ((live_price - entry_p) / entry_p) * 100
             
+            if current_profit_pct >= 1.5 and state["trailing_mode"] != "tight":
+                state["trailing_mode"] = "tight"
+                send_whatsapp_alert("Checkpoint 2 Hit (1.5%). Long SL shifted to tight 0.8x ATR trailing mode.")
+                save_state(state)
+            elif current_profit_pct >= 1.0 and state["trailing_mode"] == "initial":
+                state["trailing_mode"] = "standard"
+                send_whatsapp_alert("Checkpoint 1 Hit (1%). Long SL shifted to standard 1.5x ATR trailing mode.")
+                save_state(state)
+            
+            if state["trailing_mode"] == "tight":
+                current_stop = state["highest_price"] - (0.8 * atr_val)
+            elif state["trailing_mode"] == "standard":
+                current_stop = state["highest_price"] - (1.5 * atr_val)
+            else:
+                current_stop = entry_p * (1 - (STOP_PERCENT / 100))
+                
             if live_price < current_stop:
                 execute_trade('sell', abs(current_pos))
-                send_whatsapp_alert(f"🚨 *STOP TRIGGERED (LONG)*\nClosed position at {live_price}.\nReason: 15m Structural Stop/BE hit.")
-                state = {"position_size": 0.0, "entry_price": None, "break_even_protected": False}
+                send_whatsapp_alert(f"STOP LOSS HIT (LONG). Closed position at {live_price}. Mode: {state['trailing_mode'].upper()}")
+                state = {"position_size": 0.0, "entry_price": None, "highest_price": None, "lowest_price": None, "trailing_mode": "initial"}
                 save_state(state)
                 return
                 
-        # Short Position Tracking Rules
-        elif current_pos < 0:
-            if not state["break_even_protected"] and (live_price <= entry_p * (1 - (BREAK_EVEN_TRIGGER / 100))):
-                state["break_even_protected"] = True
-                send_whatsapp_alert(f"🛡️ *Break-Even Protected*\n15m Short entry at {entry_p} is now protected at par.")
+        elif current_pos < 0:  # Short Position Risk Tracking
+            if state["lowest_price"] is None or live_price < state["lowest_price"]:
+                state["lowest_price"] = live_price
                 save_state(state)
                 
-            current_stop = entry_p if state["break_even_protected"] else (entry_p * (1 + (STOP_PERCENT / 100)))
+            current_profit_pct = ((entry_p - live_price) / entry_p) * 100
             
+            if current_profit_pct >= 1.5 and state["trailing_mode"] != "tight":
+                state["trailing_mode"] = "tight"
+                send_whatsapp_alert("Checkpoint 2 Hit (1.5%). Short SL shifted to tight 0.8x ATR trailing mode.")
+                save_state(state)
+            elif current_profit_pct >= 1.0 and state["trailing_mode"] == "initial":
+                state["trailing_mode"] = "standard"
+                send_whatsapp_alert("Checkpoint 1 Hit (1%). Short SL shifted to standard 1.5x ATR trailing mode.")
+                save_state(state)
+            
+            if state["trailing_mode"] == "tight":
+                current_stop = state["lowest_price"] + (0.8 * atr_val)
+            elif state["trailing_mode"] == "standard":
+                current_stop = state["lowest_price"] + (1.5 * atr_val)
+            else:
+                current_stop = entry_p * (1 + (STOP_PERCENT / 100))
+                
             if live_price > current_stop:
                 execute_trade('buy', abs(current_pos))
-                send_whatsapp_alert(f"🚨 *STOP TRIGGERED (SHORT)*\nClosed position at {live_price}.\nReason: 15m Structural Stop/BE hit.")
-                state = {"position_size": 0.0, "entry_price": None, "break_even_protected": False}
+                send_whatsapp_alert(f"STOP LOSS HIT (SHORT). Closed position at {live_price}. Mode: {state['trailing_mode'].upper()}")
+                state = {"position_size": 0.0, "entry_price": None, "highest_price": None, "lowest_price": None, "trailing_mode": "initial"}
                 save_state(state)
                 return
 
-    # 8. Entry Order Allocations
+    # 8. Entry Order Allocations & Dynamic Reversals
     if long_entry_condition:
         if current_pos < 0:
             execute_trade('buy', abs(current_pos))
             execute_trade('buy', 0.2)
-            state = {"position_size": 0.2, "entry_price": live_price, "break_even_protected": False}
-            send_whatsapp_alert(f"🚀 *LONG REVERSAL (15m/1h)*\nFlipped Short to Long. Opened 0.2 BTC at {live_price}.")
+            state = {"position_size": 0.2, "entry_price": live_price, "highest_price": live_price, "lowest_price": None, "trailing_mode": "initial"}
+            send_whatsapp_alert(f"LONG REVERSAL (15m/1h). Flipped Short to Long. Opened 0.2 BTC at {live_price}.")
         else:
             execute_trade('buy', 0.1)
-            state = {"position_size": 0.1, "entry_price": live_price, "break_even_protected": False}
-            send_whatsapp_alert(f"🟢 *LONG ENTRY (15m/1h)*\nBought 0.1 BTC at {live_price}.")
+            state = {"position_size": 0.1, "entry_price": live_price, "highest_price": live_price, "lowest_price": None, "trailing_mode": "initial"}
+            send_whatsapp_alert(f"LONG ENTRY (15m/1h). Bought 0.1 BTC at {live_price}.")
         save_state(state)
         
     elif short_entry_condition:
         if current_pos > 0:
             execute_trade('sell', abs(current_pos))
             execute_trade('sell', 0.2)
-            state = {"position_size": -0.2, "entry_price": live_price, "break_even_protected": False}
-            send_whatsapp_alert(f"💥 *SHORT REVERSAL (15m/1h)*\nFlipped Long to Short. Opened 0.2 BTC at {live_price}.")
+            state = {"position_size": -0.2, "entry_price": live_price, "highest_price": None, "lowest_price": live_price, "trailing_mode": "initial"}
+            send_whatsapp_alert(f"SHORT REVERSAL (15m/1h). Flipped Long to Short. Opened 0.2 BTC at {live_price}.")
         else:
             execute_trade('sell', 0.1)
-            state = {"position_size": -0.1, "entry_price": live_price, "break_even_protected": False}
-            send_whatsapp_alert(f"🔴 *SHORT ENTRY (15m/1h)*\nSold 0.1 BTC at {live_price}.")
+            state = {"position_size": -0.1, "entry_price": live_price, "highest_price": None, "lowest_price": live_price, "trailing_mode": "initial"}
+            send_whatsapp_alert(f"SHORT ENTRY (15m/1h). Sold 0.1 BTC at {live_price}.")
         save_state(state)
 
 # --- Active Strategy Execution Loop ---
-print("[START] Delta India 15m/1h Crypto Automation Running...")
-send_whatsapp_alert("✅ Cloud trading engine successfully initialized on Render (15m/1h Configuration). Monitoring live ticks...")
+print("[START] Delta India 15m/1h Crypto Automation Running with Advanced ATR Trailing Stops...")
 
 while True:
     try:
         run_strategy()
     except Exception as e:
         print(f"[CRITICAL ERROR] Main loop cycle fault: {e}")
-    time.sleep(30)  # Evaluate parameters every 30 seconds
+    time.sleep(30)
