@@ -234,7 +234,7 @@ def run_strategy():
             state = {"position_size": 0.1, "entry_price": live_price, "highest_price": live_price, "lowest_price": None, "trailing_mode": "initial"}
             send_whatsapp_alert(f"LONG ENTRY (15m/1h). Bought 0.1 BTC at {live_price}.")
         save_state(state)
-            elif short_entry_condition:
+        elif short_entry_condition:
         if current_pos > 0:
             execute_trade('sell', abs(current_pos))
             execute_trade('sell', 0.2)
