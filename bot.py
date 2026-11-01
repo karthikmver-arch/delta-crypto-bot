@@ -222,7 +222,7 @@ def run_strategy():
                 save_state(state)
                 return
 
-    # 8. Entry Order Allocations & Dynamic Reversals
+        # 8. Entry Order Allocations & Dynamic Reversals
     if long_entry_condition:
         if current_pos < 0:
             execute_trade('buy', abs(current_pos))
@@ -234,7 +234,8 @@ def run_strategy():
             state = {"position_size": 0.1, "entry_price": live_price, "highest_price": live_price, "lowest_price": None, "trailing_mode": "initial"}
             send_whatsapp_alert(f"LONG ENTRY (15m/1h). Bought 0.1 BTC at {live_price}.")
         save_state(state)
-        elif short_entry_condition:
+        
+    elif short_entry_condition:
         if current_pos > 0:
             execute_trade('sell', abs(current_pos))
             execute_trade('sell', 0.2)
@@ -245,6 +246,7 @@ def run_strategy():
             state = {"position_size": -0.1, "entry_price": live_price, "highest_price": None, "lowest_price": live_price, "trailing_mode": "initial"}
             send_whatsapp_alert(f"SHORT ENTRY (15m/1h). Sold 0.1 BTC at {live_price}.")
         save_state(state)
+
 
 # --- Active Strategy Execution Loop ---
 print("[START] Delta India 15m/1h Crypto Automation Running with Advanced ATR Trailing Stops...")
