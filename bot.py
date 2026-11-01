@@ -35,8 +35,8 @@ STATE_FILE = "bot_state.json"
 class DeltaIndiaExchange(ccxt.delta):
     def __init__(self, config={}):
         super(DeltaIndiaExchange, self).__init__(config)
-        self.urls['api']['public'] = 'https://delta.exchange'
-        self.urls['api']['private'] = 'https://delta.exchange'
+        self.urls['api']['public'] = 'https://api.india.delta.exchange'
+        self.urls['api']['private'] = 'https://api.india.delta.exchange'
 
 exchange = DeltaIndiaExchange({
     'apiKey': os.getenv('DELTA_API_KEY'),
@@ -45,8 +45,8 @@ exchange = DeltaIndiaExchange({
 })
 
 # Overriding internal endpoints guarantees ccxt can never leak calls to the global domain paths
-exchange.api['public'] = 'https://delta.exchange'
-exchange.api['private'] = 'https://delta.exchange'
+exchange.api['public'] = 'https://api.india.delta.exchange'
+exchange.api['private'] = 'https://api.india.delta.exchange'
 
 # --- WhatsApp Alert Core Engine ---
 def send_whatsapp_alert(msg):
