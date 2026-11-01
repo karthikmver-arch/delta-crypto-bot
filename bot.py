@@ -30,18 +30,23 @@ ATR_VOLUME_PERIOD = 20
 
 STATE_FILE = "bot_state.json"
 
-# --- Delta Exchange India Configuration ---
-exchange = ccxt.delta({
+# --- Delta Exchange India Hard-Targeting Architecture ---
+# Using the raw exchange initializer subclass forces ccxt to throw away its global asset maps
+class DeltaIndiaExchange(ccxt.delta):
+    def __init__(self, config={}):
+        super(DeltaIndiaExchange, self).__init__(config)
+        self.urls['api']['public'] = 'https://delta.exchange'
+        self.urls['api']['private'] = 'https://delta.exchange'
+
+exchange = DeltaIndiaExchange({
     'apiKey': os.getenv('DELTA_API_KEY'),
     'secret': os.getenv('DELTA_API_SECRET'),
-    'enableRateLimit': True,
-    'urls': {
-        'api': {
-            'public': 'https://delta.exchange',
-            'private': 'https://delta.exchange',
-        }
-    }
+    'enableRateLimit': True
 })
+
+# Overriding internal endpoints guarantees ccxt can never leak calls to the global domain paths
+exchange.api['public'] = 'https://delta.exchange'
+exchange.api['private'] = 'https://delta.exchange'
 
 # --- WhatsApp Alert Core Engine ---
 def send_whatsapp_alert(msg):
@@ -123,7 +128,7 @@ def run_strategy():
     
     latest_htf_smoothed = df_htf['rsi_smoothed'].iloc[-1]
     
-    # 4. Extract Last Closed Values (Pine index [-2] equivalents)
+    # 4. Extract Last Closed Values
     ltf_rsi = df_ltf['rsi'].iloc[-2]
     ltf_rsi_prior = df_ltf['rsi'].iloc[-3]
     atr_val = df_ltf['atr'].iloc[-2]
@@ -229,8 +234,7 @@ def run_strategy():
             state = {"position_size": 0.1, "entry_price": live_price, "highest_price": live_price, "lowest_price": None, "trailing_mode": "initial"}
             send_whatsapp_alert(f"LONG ENTRY (15m/1h). Bought 0.1 BTC at {live_price}.")
         save_state(state)
-        
-    elif short_entry_condition:
+            elif short_entry_condition:
         if current_pos > 0:
             execute_trade('sell', abs(current_pos))
             execute_trade('sell', 0.2)
@@ -251,3 +255,4 @@ while True:
     except Exception as e:
         print(f"[CRITICAL ERROR] Main loop cycle fault: {e}")
     time.sleep(30)
+
