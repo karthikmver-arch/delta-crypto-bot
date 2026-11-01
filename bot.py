@@ -34,12 +34,13 @@ STATE_FILE = "bot_state.json"
 # --- Delta Exchange India Configuration ---
 exchange = ccxt.delta({
     'apiKey': os.getenv('DELTA_API_KEY'),
-    'secret': os.getenv('DELTA_SECRET_KEY'),
+    'secret': os.getenv('DELTA_API_SECRET'),
+
     'enableRateLimit': True,
     'urls': {
         'api': {
-            'public': 'https://delta.exchange',
-            'private': 'https://delta.exchange',
+            'public': 'https://api.india.delta.exchange',
+            'private': 'https://api.india.delta.exchange',
         }
     }
 })
