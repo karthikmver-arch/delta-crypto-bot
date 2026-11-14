@@ -28,7 +28,11 @@ def send_telegram_msg(text):
   if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     print("Missing Telegram credentials!")
     return
-  url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage"
+  url = (
+    "https://"
+    + "api.telegram.org"
+    + f"/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+)
   try:
     requests.post(
         url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
@@ -38,7 +42,7 @@ def send_telegram_msg(text):
 
 
 def fetch_candles(symbol, resolution="15m", count=250):
-  url = "https://delta.exchange"
+url = "https://" + "api.india.delta.exchange" + "/v2/history/candles"
   now = int(time.time())
   sec_per_candle = 900 if resolution == "15m" else 300
   start = now - (count * sec_per_candle)
