@@ -7,7 +7,7 @@ concurrency:
 on:
   schedule:
     # This triggers the bot to boot up and run every hour automatically
-    - cron: '0 * * * *'  # Runs every hour
+     - cron: '0 * * * *' # Runs every hour
   workflow_dispatch:     # Allows you to click a button to start it manually anytime
 
 jobs:
@@ -27,12 +27,10 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          pip install numpy pandas requests
 
       - name: Execute Trading Script
         env:
-          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
-          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
-          TWILIO_SID: ${{ secrets.TWILIO_SID }}
-          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
-          MY_WHATSAPP_NUMBER: ${{ secrets.MY_WHATSAPP_NUMBER }}
-        run: python bot.py
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -u bot.py
