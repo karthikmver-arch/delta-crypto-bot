@@ -1,260 +1,278 @@
-import time
 import os
-import json
-import ccxt
+import time
+import numpy as np
 import pandas as pd
-import pandas_ta as ta
-from twilio.rest import Client
+import requests
 
-# --- Secure Configuration Layer (Reads from GitHub Repository Secrets) ---
-TWILIO_SID    = os.getenv('TWILIO_SID')
-TWILIO_TOKEN  = os.getenv('TWILIO_TOKEN')
-FROM_WHATSAPP = 'whatsapp:+14155238886'
-TO_WHATSAPP   = os.getenv('MY_WHATSAPP_NUMBER')
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# --- Strategy Constants & Inputs (Optimized Timeframes) ---
-SYMBOL = 'BTC/USDT:USDT'
-LTF_TIMEFRAME = '15m'
-HTF_TIMEFRAME = '1h'
+# Delta Exchange India tickers
+COINS = {
+    "BTC": "BTCUSD",
+    "ETH": "ETHUSD",
+    "SOL": "SOLUSD",
+    "ZEC": "ZECUSD",
+    "XAR": "XARUSD",
+    "XAU": "PAXGUSD",
+}
 
-RSI_LENGTH = 14
-HTF_SMOOTH_LEN = 9
+LAST_15M_TIME = {coin: None for coin in COINS}
+LAST_5M_TIME = {coin: None for coin in COINS}
+ACTIVE_TRADE = {coin: None for coin in COINS}
+ENTRY_PRICES = {coin: 0.0 for coin in COINS}
+TRAILING_SL_PRICES = {coin: 0.0 for coin in COINS}
 
-LONG_FLOOR = 30
-LONG_TRIGGER = 35
-SHORT_CEILING = 70
-SHORT_TRIGGER = 65
 
-STOP_PERCENT = 2.5
-ATR_VOLUME_PERIOD = 20
+def send_telegram_msg(text):
+  if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print("Missing Telegram credentials!")
+    return
+  url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage"
+  try:
+    requests.post(
+        url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
+    )
+  except Exception as e:
+    print(f"Telegram error: {e}")
 
-STATE_FILE = "bot_state.json"
 
-# --- Delta Exchange India Hard-Targeting Architecture ---
-# Using the raw exchange initializer subclass forces ccxt to throw away its global asset maps
-class DeltaIndiaExchange(ccxt.delta):
-    def __init__(self, config={}):
-        super(DeltaIndiaExchange, self).__init__(config)
-        self.urls['api']['public'] = 'https://api.india.delta.exchange'
-        self.urls['api']['private'] = 'https://api.india.delta.exchange'
-
-exchange = DeltaIndiaExchange({
-    'apiKey': os.getenv('DELTA_API_KEY'),
-    'secret': os.getenv('DELTA_API_SECRET'),
-    'enableRateLimit': True
-})
-
-# Overriding internal endpoints guarantees ccxt can never leak calls to the global domain paths
-exchange.api['public'] = 'https://api.india.delta.exchange'
-exchange.api['private'] = 'https://api.india.delta.exchange'
-
-# --- WhatsApp Alert Core Engine ---
-def send_whatsapp_alert(msg):
-    try:
-        if not TWILIO_SID or not TWILIO_TOKEN or not TO_WHATSAPP:
-            print(f"[WHATSAPP SKIP] Environment variables missing. Alert log: {msg}")
-            return
-            
-        client = Client(TWILIO_SID, TWILIO_TOKEN)
-        client.messages.create(
-            body=f"Delta Bot Alert: {msg}",
-            from_=FROM_WHATSAPP,
-            to=TO_WHATSAPP
-        )
-        print(f"[WHATSAPP] Alert sent successfully: {msg}")
-    except Exception as e:
-        print(f"[WHATSAPP ERROR] Failed to send notification: {e}")
-
-# --- Local State Persistence Engine ---
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"position_size": 0.0, "entry_price": None, "highest_price": None, "lowest_price": None, "trailing_mode": "initial"}
-
-def save_state(state):
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f)
-
-def get_market_data(symbol, timeframe, limit=200):
-    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+def fetch_candles(symbol, resolution="15m", count=250):
+  url = "https://delta.exchange"
+  now = int(time.time())
+  sec_per_candle = 900 if resolution == "15m" else 300
+  start = now - (count * sec_per_candle)
+  params = {
+      "symbol": symbol,
+      "resolution": resolution,
+      "start": start,
+      "end": now,
+  }
+  try:
+    r = requests.get(url, params=params, timeout=10)
+    if r.status_code != 200:
+      print(f"HTTP {r.status_code} for {symbol}: {r.text[:120]}")
+      return None
+    data = r.json().get("result", [])
+    if not data:
+      return None
+    df = pd.DataFrame(data)
+    df = df.sort_values("time").reset_index(drop=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+      df[col] = df[col].astype(float)
     return df
+  except Exception as e:
+    print(f"Error fetching {symbol} ({resolution}): {e}")
+    return None
 
-def execute_trade(side, quantity, order_type='market'):
-    try:
-        print(f"[ORDER] Submitting {side.upper()} order for {quantity} {SYMBOL}...")
-        order = exchange.create_order(
-            symbol=SYMBOL,
-            type=order_type,
-            side=side,
-            amount=quantity
+
+def calculate_parabolic_sar(df, af_start=0.02, af_step=0.02, af_max=0.20):
+  high = df["high"].values
+  low = df["low"].values
+  n = len(df)
+  sar = np.zeros(n)
+  bull = True
+  af = af_start
+  ep = low[0]
+  sar[0] = high[0]
+
+  for i in range(1, n):
+    if bull:
+      sar[i] = sar[i - 1] + af * (ep - sar[i - 1])
+      sar[i] = min(sar[i], low[i - 1], low[i - 2] if i >= 2 else low[i - 1])
+      if low[i] < sar[i]:
+        bull = False
+        sar[i] = ep
+        ep = low[i]
+        af = af_start
+      else:
+        if high[i] > ep:
+          ep = high[i]
+          af = min(af + af_step, af_max)
+    else:
+      sar[i] = sar[i - 1] + af * (ep - sar[i - 1])
+      sar[i] = max(sar[i], high[i - 1], high[i - 2] if i >= 2 else high[i - 1])
+      if high[i] > sar[i]:
+        bull = True
+        sar[i] = ep
+        ep = high[i]
+        af = af_start
+      else:
+        if low[i] < ep:
+          ep = low[i]
+          af = min(af + af_step, af_max)
+  return sar
+
+
+def add_indicators(df):
+  df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+  df["date"] = pd.to_datetime(df["time"], unit="s").dt.date
+  df["tp"] = (df["high"] + df["low"] + df["close"]) / 3
+  df["pv"] = df["tp"] * df["volume"]
+  df["vwap"] = df.groupby("date")["pv"].cumsum() / df.groupby("date")[
+      "volume"
+  ].cumsum().replace(0, np.nan)
+  df["vwap"] = df["vwap"].fillna(df["tp"])
+  df["sar"] = calculate_parabolic_sar(df)
+
+  delta = df["close"].diff()
+  gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+  loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+  rs = gain / loss.replace(0, np.nan)
+  rsi = 100 - (100 / (1 + rs))
+
+  min_rsi = rsi.rolling(14).min()
+  max_rsi = rsi.rolling(14).max()
+  stoch_rsi = ((rsi - min_rsi) / (max_rsi - min_rsi).replace(0, np.nan)) * 100
+  df["stoch_k"] = stoch_rsi.rolling(3).mean()
+  df["stoch_d"] = df["stoch_k"].rolling(3).mean()
+  return df
+
+
+def scan_market(first_run=False):
+  global LAST_15M_TIME, LAST_5M_TIME, ACTIVE_TRADE, ENTRY_PRICES, TRAILING_SL_PRICES
+  active_coins = []
+
+  for name, symbol in COINS.items():
+    df_15m = fetch_candles(symbol, resolution="15m", count=250)
+    if df_15m is None or len(df_15m) < 205:
+      continue
+
+    if first_run:
+      active_coins.append(f"{name} ({df_15m['close'].iloc[-1]:.2f})")
+
+    live_price = df_15m["close"].iloc[-1]
+
+    # 1. ACTIVE TRADE MANAGEMENT (5m Trailing SL)
+    if ACTIVE_TRADE[name] is not None:
+      if ACTIVE_TRADE[name] == "BUY" and live_price <= TRAILING_SL_PRICES[name]:
+        pnl_pct = (
+            (TRAILING_SL_PRICES[name] - ENTRY_PRICES[name])
+            / ENTRY_PRICES[name]
+        ) * 100
+        msg = (
+            f"🛑 TRAILING SL HIT (BUY): {name}\nClosed at:"
+            f" {TRAILING_SL_PRICES[name]:.4f} ({pnl_pct:+.2f}%)"
         )
-        print(f"[SUCCESS] Order Executed ID: {order['id']}")
-        return order
-    except Exception as e:
-        print(f"[ERROR] Trade execution failed: {e}")
-        return None
+        send_telegram_msg(msg)
+        print(msg)
+        ACTIVE_TRADE[name] = None
+        continue
 
-def check_bars_since(series_condition, limit=10):
-    for i in range(1, limit + 1):
-        if series_condition.iloc[-i]:
-            return i - 1
-    return 999
+      elif (
+          ACTIVE_TRADE[name] == "SELL"
+          and live_price >= TRAILING_SL_PRICES[name]
+      ):
+        pnl_pct = (
+            (ENTRY_PRICES[name] - TRAILING_SL_PRICES[name])
+            / ENTRY_PRICES[name]
+        ) * 100
+        msg = (
+            f"🛑 TRAILING SL HIT (SELL): {name}\nClosed at:"
+            f" {TRAILING_SL_PRICES[name]:.4f} ({pnl_pct:+.2f}%)"
+        )
+        send_telegram_msg(msg)
+        print(msg)
+        ACTIVE_TRADE[name] = None
+        continue
 
-def run_strategy():
-    state = load_state()
-    
-    # 1. Fetch Market Matrix
-    try:
-        df_ltf = get_market_data(SYMBOL, LTF_TIMEFRAME, limit=100)
-        df_htf = get_market_data(SYMBOL, HTF_TIMEFRAME, limit=100)
-    except Exception as e:
-        print(f"[ERROR] Connection / Data fetch error: {e}")
-        return
+      df_5m = fetch_candles(symbol, resolution="5m", count=60)
+      if df_5m is not None and len(df_5m) >= 20:
+        df_5m["sar"] = calculate_parabolic_sar(df_5m)
+        curr_5m = df_5m.iloc[-2]
+        if LAST_5M_TIME[name] != curr_5m["time"]:
+          LAST_5M_TIME[name] = curr_5m["time"]
+          sar_5m = curr_5m["sar"]
 
-    # 2. LTF Technical Metrics (15m)
-    df_ltf['rsi'] = ta.rsi(df_ltf['close'], length=RSI_LENGTH)
-    df_ltf['atr'] = ta.atr(df_ltf['high'], df_ltf['low'], df_ltf['close'], length=14)
-    df_ltf['atr_avg'] = ta.sma(df_ltf['atr'], length=ATR_VOLUME_PERIOD)
-    
-    # 3. HTF Macro Metrics (1h)
-    df_htf['rsi'] = ta.rsi(df_htf['close'], length=RSI_LENGTH)
-    df_htf['rsi_smoothed'] = ta.ema(df_htf['rsi'], length=HTF_SMOOTH_LEN)
-    
-    latest_htf_smoothed = df_htf['rsi_smoothed'].iloc[-1]
-    
-    # 4. Extract Last Closed Values
-    ltf_rsi = df_ltf['rsi'].iloc[-2]
-    ltf_rsi_prior = df_ltf['rsi'].iloc[-3]
-    atr_val = df_ltf['atr'].iloc[-2]
-    atr_avg = df_ltf['atr_avg'].iloc[-2]
-    
-    # 5. Calculate Crossovers & Floor Ranges
-    crossover_long = (ltf_rsi_prior <= LONG_TRIGGER) and (ltf_rsi > LONG_TRIGGER)
-    crossunder_short = (ltf_rsi_prior >= SHORT_TRIGGER) and (ltf_rsi < SHORT_TRIGGER)
-    
-    condition_floor_long = df_ltf['rsi'] < LONG_FLOOR
-    condition_ceiling_short = df_ltf['rsi'] > SHORT_CEILING
-    
-    bars_since_floor = check_bars_since(condition_floor_long, limit=12)
-    bars_since_ceiling = check_bars_since(condition_ceiling_short, limit=12)
-    
-    # 6. Strategy Evaluation Blocks
-    market_is_volatile = atr_val > (atr_avg * 0.85)
-    bullish_macro = latest_htf_smoothed > 50
-    bearish_macro = latest_htf_smoothed < 50
-    
-    long_snapback = crossover_long and (bars_since_floor < 10)
-    short_snapback = crossunder_short and (bars_since_ceiling < 10)
-    
-    long_entry_condition = long_snapback and bullish_macro and market_is_volatile and (state["position_size"] <= 0)
-    short_entry_condition = short_snapback and bearish_macro and market_is_volatile and (state["position_size"] >= 0)
-    
-    current_pos = state["position_size"]
-    live_price = df_ltf['close'].iloc[-1]
-    
-    # --- Advanced ATR Trailing Risk Engine ---
-    if current_pos != 0:
-        entry_p = state["entry_price"]
-        
-        if current_pos > 0:  # Long Position Risk Tracking
-            if state["highest_price"] is None or live_price > state["highest_price"]:
-                state["highest_price"] = live_price
-                save_state(state)
-                
-            current_profit_pct = ((live_price - entry_p) / entry_p) * 100
-            
-            if current_profit_pct >= 1.5 and state["trailing_mode"] != "tight":
-                state["trailing_mode"] = "tight"
-                send_whatsapp_alert("Checkpoint 2 Hit (1.5%). Long SL shifted to tight 0.8x ATR trailing mode.")
-                save_state(state)
-            elif current_profit_pct >= 1.0 and state["trailing_mode"] == "initial":
-                state["trailing_mode"] = "standard"
-                send_whatsapp_alert("Checkpoint 1 Hit (1%). Long SL shifted to standard 1.5x ATR trailing mode.")
-                save_state(state)
-            
-            if state["trailing_mode"] == "tight":
-                current_stop = state["highest_price"] - (0.8 * atr_val)
-            elif state["trailing_mode"] == "standard":
-                current_stop = state["highest_price"] - (1.5 * atr_val)
-            else:
-                current_stop = entry_p * (1 - (STOP_PERCENT / 100))
-                
-            if live_price < current_stop:
-                execute_trade('sell', abs(current_pos))
-                send_whatsapp_alert(f"STOP LOSS HIT (LONG). Closed position at {live_price}. Mode: {state['trailing_mode'].upper()}")
-                state = {"position_size": 0.0, "entry_price": None, "highest_price": None, "lowest_price": None, "trailing_mode": "initial"}
-                save_state(state)
-                return
-                
-        elif current_pos < 0:  # Short Position Risk Tracking
-            if state["lowest_price"] is None or live_price < state["lowest_price"]:
-                state["lowest_price"] = live_price
-                save_state(state)
-                
-            current_profit_pct = ((entry_p - live_price) / entry_p) * 100
-            
-            if current_profit_pct >= 1.5 and state["trailing_mode"] != "tight":
-                state["trailing_mode"] = "tight"
-                send_whatsapp_alert("Checkpoint 2 Hit (1.5%). Short SL shifted to tight 0.8x ATR trailing mode.")
-                save_state(state)
-            elif current_profit_pct >= 1.0 and state["trailing_mode"] == "initial":
-                state["trailing_mode"] = "standard"
-                send_whatsapp_alert("Checkpoint 1 Hit (1%). Short SL shifted to standard 1.5x ATR trailing mode.")
-                save_state(state)
-            
-            if state["trailing_mode"] == "tight":
-                current_stop = state["lowest_price"] + (0.8 * atr_val)
-            elif state["trailing_mode"] == "standard":
-                current_stop = state["lowest_price"] + (1.5 * atr_val)
-            else:
-                current_stop = entry_p * (1 + (STOP_PERCENT / 100))
-                
-            if live_price > current_stop:
-                execute_trade('buy', abs(current_pos))
-                send_whatsapp_alert(f"STOP LOSS HIT (SHORT). Closed position at {live_price}. Mode: {state['trailing_mode'].upper()}")
-                state = {"position_size": 0.0, "entry_price": None, "highest_price": None, "lowest_price": None, "trailing_mode": "initial"}
-                save_state(state)
-                return
+          if ACTIVE_TRADE[name] == "BUY" and sar_5m < curr_5m["close"]:
+            new_sl = sar_5m * 0.9985
+            if new_sl > TRAILING_SL_PRICES[name]:
+              TRAILING_SL_PRICES[name] = new_sl
+              send_telegram_msg(
+                  f"📈 5m TRAILING SL UPDATED (BUY): {name}\nNew SL:"
+                  f" {new_sl:.4f}"
+              )
 
-        # 8. Entry Order Allocations & Dynamic Reversals
-    if long_entry_condition:
-        if current_pos < 0:
-            execute_trade('buy', abs(current_pos))
-            execute_trade('buy', 0.2)
-            state = {"position_size": 0.2, "entry_price": live_price, "highest_price": live_price, "lowest_price": None, "trailing_mode": "initial"}
-            send_whatsapp_alert(f"LONG REVERSAL (15m/1h). Flipped Short to Long. Opened 0.2 BTC at {live_price}.")
-        else:
-            execute_trade('buy', 0.1)
-            state = {"position_size": 0.1, "entry_price": live_price, "highest_price": live_price, "lowest_price": None, "trailing_mode": "initial"}
-            send_whatsapp_alert(f"LONG ENTRY (15m/1h). Bought 0.1 BTC at {live_price}.")
-        save_state(state)
-        
-    elif short_entry_condition:
-        if current_pos > 0:
-            execute_trade('sell', abs(current_pos))
-            execute_trade('sell', 0.2)
-            state = {"position_size": -0.2, "entry_price": live_price, "highest_price": None, "lowest_price": live_price, "trailing_mode": "initial"}
-            send_whatsapp_alert(f"SHORT REVERSAL (15m/1h). Flipped Long to Short. Opened 0.2 BTC at {live_price}.")
-        else:
-            execute_trade('sell', 0.1)
-            state = {"position_size": -0.1, "entry_price": live_price, "highest_price": None, "lowest_price": live_price, "trailing_mode": "initial"}
-            send_whatsapp_alert(f"SHORT ENTRY (15m/1h). Sold 0.1 BTC at {live_price}.")
-        save_state(state)
+          elif ACTIVE_TRADE[name] == "SELL" and sar_5m > curr_5m["close"]:
+            new_sl = sar_5m * 1.0015
+            if new_sl < TRAILING_SL_PRICES[name]:
+              TRAILING_SL_PRICES[name] = new_sl
+              send_telegram_msg(
+                  f"📉 5m TRAILING SL UPDATED (SELL): {name}\nNew SL:"
+                  f" {new_sl:.4f}"
+              )
+
+    # 2. NEW 15m ENTRY SCAN
+    df_15m = add_indicators(df_15m)
+    curr = df_15m.iloc[-2]
+    prev = df_15m.iloc[-3]
+
+    if LAST_15M_TIME[name] == curr["time"]:
+      continue
+    LAST_15M_TIME[name] = curr["time"]
+
+    if ACTIVE_TRADE[name] is None:
+      price = curr["close"]
+      ema200 = curr["ema200"]
+      vwap = curr["vwap"]
+      sar_15m = curr["sar"]
+
+      stoch_sell_hook = (
+          max(prev["stoch_k"], curr["stoch_k"]) >= 80
+          and prev["stoch_k"] >= prev["stoch_d"]
+          and curr["stoch_k"] < curr["stoch_d"]
+      )
+      stoch_buy_hook = (
+          min(prev["stoch_k"], curr["stoch_k"]) <= 20
+          and prev["stoch_k"] <= prev["stoch_d"]
+          and curr["stoch_k"] > curr["stoch_d"]
+      )
+
+      signal = None
+      if price > ema200 and sar_15m < price and stoch_buy_hook:
+        signal = "BUY"
+        initial_sl = sar_15m * 0.9985
+      elif price < ema200 and sar_15m > price and stoch_sell_hook:
+        signal = "SELL"
+        initial_sl = sar_15m * 1.0015
+
+      if signal:
+        ACTIVE_TRADE[name] = signal
+        ENTRY_PRICES[name] = price
+        TRAILING_SL_PRICES[name] = initial_sl
+        risk_pct = (abs(price - initial_sl) / price) * 100
+        emoji = "🟢" if signal == "BUY" else "🔴"
+        vwap_status = "Above VWAP" if price > vwap else "Below VWAP"
+        msg = (
+            f"{emoji} {signal} ENTRY: {name} (15m)\n"
+            f"Entry: {price:.4f}\n"
+            f"🛡️ Initial SL (15m SAR): {initial_sl:.4f} (-{risk_pct:.2f}%)\n"
+            f"EMA 200: {ema200:.4f} | VWAP: {vwap:.4f} ({vwap_status})\n"
+            f"StochRSI K: {curr['stoch_k']:.1f}"
+        )
+        send_telegram_msg(msg)
+        print(msg)
+
+  if first_run:
+    if active_coins:
+      send_telegram_msg(
+          "✅ Scanner Connected! Tracking:\n" + ", ".join(active_coins)
+      )
+    else:
+      send_telegram_msg(
+          "⚠️ Scanner started, but Delta Exchange blocked candle fetch (check"
+          " GitHub Actions log)."
+      )
 
 
-# --- Active Strategy Execution Loop ---
-print("[START] Delta India 15m/1h Crypto Automation Running with Advanced ATR Trailing Stops...")
+def main():
+  print("Starting GitHub Actions 15m/5m Scanner...")
+  for cycle in range(55):
+    scan_market(first_run=(cycle == 0))
+    if cycle == 0:
+      print("Initial scan completed successfully.")
+    time.sleep(60)
 
-while True:
-    try:
-        run_strategy()
-    except Exception as e:
-        print(f"[CRITICAL ERROR] Main loop cycle fault: {e}")
-    time.sleep(30)
 
+if __name__ == "__main__":
+  main()
