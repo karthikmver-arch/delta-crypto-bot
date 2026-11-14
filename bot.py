@@ -42,7 +42,7 @@ def send_telegram_msg(text):
 
 
 def fetch_candles(symbol, resolution="15m", count=250):
-url = "https://" + "api.india.delta.exchange" + "/v2/history/candles"
+  url = "https://" + "api.india.delta.exchange" + "/v2/history/candles"
   now = int(time.time())
   sec_per_candle = 900 if resolution == "15m" else 300
   start = now - (count * sec_per_candle)
